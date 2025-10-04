@@ -54,13 +54,20 @@ fn main() -> Result<()> {
                 .long("json-only")
                 .action(clap::ArgAction::SetTrue),
         )
+        .arg(
+            Arg::new("delete")
+                .help("Remove file from db")
+                .short('d')
+                .long("delete")
+                .action(clap::ArgAction::SetTrue),
+        )
         .get_matches();
 
     let file_path = matches.get_one::<String>("file").unwrap();
     let base_dir = matches.get_one::<String>("base_dir").unwrap();
     let db_path = matches.get_one::<String>("database").unwrap();
     let json_only = matches.get_flag("json-only");
-
+    let delete = matches.get_flag("delete");
     info!(
         "Starting scan: file={}, base_dir={}, db_path={}, json_only={}",
         file_path, base_dir, db_path, json_only
@@ -69,6 +76,10 @@ fn main() -> Result<()> {
     if json_only {
         let result = process_file_json_only(file_path, base_dir)?;
         println!("{}", serde_json::to_string_pretty(&result)?);
+    } else if delete {
+        let conn = Connection::open(db_path)?;
+        remove_file_from_db(&conn, file_path, base_dir)?;
+        println!("Ok")
     } else {
         let conn = Connection::open(db_path)?;
         setup_database(&conn)?;
@@ -80,54 +91,65 @@ fn main() -> Result<()> {
 }
 
 fn setup_database(conn: &Connection) -> Result<()> {
+    debug!("Foreign keys enabled");
+    conn.execute("PRAGMA foreign_keys = ON", [])?;
+
     debug!("Setting up database tables");
     conn.execute(
         "CREATE TABLE IF NOT EXISTS folders (
-            id INTEGER PRIMARY KEY,
-            path TEXT UNIQUE
-        )",
+                id INTEGER PRIMARY KEY,
+                path TEXT UNIQUE
+            )",
         [],
     )?;
+
+    // Files table (add CASCADE for folder_id if desired; here it's optional)
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS files (
-            id INTEGER PRIMARY KEY,
-            path TEXT UNIQUE,
-            file_name TEXT,
-            folder_id INTEGER,
-            metadata TEXT DEFAULT '{}',
-            FOREIGN KEY(folder_id) REFERENCES folders(id)
-        )",
-        [],
-    )?;
+            "CREATE TABLE IF NOT EXISTS files (
+                id INTEGER PRIMARY KEY,
+                path TEXT UNIQUE,
+                file_name TEXT,
+                folder_id INTEGER,
+                metadata TEXT DEFAULT '{}',
+                FOREIGN KEY(folder_id) REFERENCES folders(id) ON DELETE CASCADE  -- Optional: cascades if deleting folders
+            )",
+            [],
+        )?;
+
+    // Tags table (no changes)
     conn.execute(
         "CREATE TABLE IF NOT EXISTS tags (
-            id INTEGER PRIMARY KEY,
-            tag TEXT UNIQUE
-        )",
+                id INTEGER PRIMARY KEY,
+                tag TEXT UNIQUE
+            )",
         [],
     )?;
+
+    // File_tags table (cascade on file_id, but not on tag_id)
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS file_tags (
-            file_id INTEGER,
-            tag_id INTEGER,
-            FOREIGN KEY(file_id) REFERENCES files(id),
-            FOREIGN KEY(tag_id) REFERENCES tags(id),
-            UNIQUE(file_id, tag_id)
-        )",
-        [],
-    )?;
+            "CREATE TABLE IF NOT EXISTS file_tags (
+                file_id INTEGER,
+                tag_id INTEGER,
+                FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE,  -- Auto-delete tags for this file
+                FOREIGN KEY(tag_id) REFERENCES tags(id),                      -- No cascade: keep tags
+                UNIQUE(file_id, tag_id)
+            )",
+            [],
+        )?;
+
+    // Backlinks table (cascade on both file_id and backlink_id for bidirectional cleanup)
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS backlinks (
-            id INTEGER PRIMARY KEY,
-            backlink TEXT,
-            backlink_id INTEGER,
-            file_id INTEGER,
-            FOREIGN KEY(file_id) REFERENCES files(id),
-            FOREIGN KEY(backlink_id) REFERENCES files(id),
-            UNIQUE(backlink_id, file_id, backlink)
-        )",
-        [],
-    )?;
+            "CREATE TABLE IF NOT EXISTS backlinks (
+                id INTEGER PRIMARY KEY,
+                backlink TEXT,
+                backlink_id INTEGER,
+                file_id INTEGER,
+                FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE,             -- Auto-delete if target file deleted
+                FOREIGN KEY(backlink_id) REFERENCES files(id) ON DELETE CASCADE,         -- Auto-delete if source file deleted
+                UNIQUE(backlink_id, file_id, backlink)
+            )",
+            [],
+        )?;
 
     // Check if metadata column exists and add it if missing
     let mut stmt = conn.prepare("PRAGMA table_info(files)")?;
@@ -418,7 +440,6 @@ fn process_file(conn: &Connection, file_path: &str, base_dir: &str) -> Result<()
 
 fn process_file_json_only(file_path: &str, base_dir: &str) -> Result<JsonValue> {
     debug!("Processing file in JSON-only mode: {}", file_path);
-    // Canonicalize file path
     let canonical_path = Path::new(file_path).canonicalize()?;
     let file_name = canonical_path
         .file_name()
@@ -437,12 +458,11 @@ fn process_file_json_only(file_path: &str, base_dir: &str) -> Result<JsonValue> 
         file_name
     );
 
-    // Get folder path and make it relative
     let folder_path = canonical_path
         .parent()
         .map(|p| {
             if p == Path::new(base_dir) {
-                "".to_string() // Root directory
+                "".to_string()
             } else {
                 remove_string(&p.to_string_lossy(), base_dir)
             }
@@ -450,22 +470,20 @@ fn process_file_json_only(file_path: &str, base_dir: &str) -> Result<JsonValue> 
         .unwrap_or_default();
     debug!("Folder path (relative): {}", folder_path);
 
-    // Read file and process YAML and tags
     let file = File::open(&canonical_path)?;
     let reader = BufReader::new(file);
     let mut in_yaml = false;
     let mut yaml_content = String::new();
-    let mut in_tags = false;
     let mut tags = Vec::new();
     let mut in_code_block = false;
     let mut lines = Vec::new();
+    let mut metadata = JsonValue::Object(serde_json::Map::new());
 
-    // First pass: collect YAML content and tags
     debug!("Reading file for YAML and lines");
     for (line_num, line) in reader.lines().enumerate() {
         let line = line?;
         lines.push(line.clone());
-        debug!("Line {}: {}", line_num + 1, line);
+        debug!("Line {}: {}", line_num + 1, &line);
 
         if line.trim() == "```" {
             in_code_block = !in_code_block;
@@ -482,10 +500,17 @@ fn process_file_json_only(file_path: &str, base_dir: &str) -> Result<JsonValue> 
                 if in_yaml {
                     in_yaml = false;
                     if !yaml_content.trim().is_empty() {
-                        parse_yaml_frontmatter(&yaml_content, &mut tags);
+                        debug!("Parsing YAML: {}", yaml_content);
+                        if let Some(json_str) = parse_yaml_frontmatter(&yaml_content, &mut tags) {
+                            metadata = serde_json::from_str(&json_str).map_err(|e| {
+                                AppError::Io(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    format!("Failed to parse YAML JSON: {}", e),
+                                ))
+                            })?;
+                        }
                     }
                     yaml_content.clear();
-                    in_tags = false;
                 } else {
                     in_yaml = true;
                     yaml_content.clear();
@@ -498,44 +523,29 @@ fn process_file_json_only(file_path: &str, base_dir: &str) -> Result<JsonValue> 
             } else if in_yaml {
                 yaml_content.push_str(&line);
                 yaml_content.push('\n');
-                if line.starts_with("tags:") {
-                    in_tags = true;
-                    debug!("Line {}: Found 'tags:' section", line_num + 1);
-                } else if in_tags && line.trim().starts_with("-") {
-                    if let Some(tag) = line.trim().strip_prefix("-").map(|s| s.trim()) {
-                        debug!("Line {}: Found YAML tag: {}", line_num + 1, tag);
-                        tags.push(tag.to_string());
-                    } else {
-                        debug!("Line {}: Invalid YAML tag format: {}", line_num + 1, line);
-                    }
-                } else if in_tags && !line.trim().starts_with("-") {
-                    in_tags = false;
-                    debug!("Line {}: End of tags section", line_num + 1);
-                }
             }
         }
     }
 
-    // Handle case where YAML is at the end of file without closing ---
     if in_yaml && !yaml_content.trim().is_empty() {
-        debug!("File ends with open YAML frontmatter, parsing...");
-        parse_yaml_frontmatter(&yaml_content, &mut tags);
+        debug!("Parsing unclosed YAML: {}", yaml_content);
+        if let Some(json_str) = parse_yaml_frontmatter(&yaml_content, &mut tags) {
+            metadata = serde_json::from_str(&json_str).map_err(|e| {
+                AppError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Failed to parse YAML JSON: {}", e),
+                ))
+            })?;
+        }
     }
 
     debug!("YAML tags found: {:?}", tags);
 
-    // Second pass: process inline tags
-    debug!("Processing inline tags");
     in_code_block = false;
     let tag_re = Regex::new(r"#[\p{L}\p{N}_-]+").unwrap();
     for (line_num, line) in lines.iter().enumerate() {
         if line.trim() == "```" {
             in_code_block = !in_code_block;
-            debug!(
-                "Line {}: Code block {}",
-                line_num + 1,
-                if in_code_block { "started" } else { "ended" }
-            );
             continue;
         }
         if !in_code_block {
@@ -546,7 +556,7 @@ fn process_file_json_only(file_path: &str, base_dir: &str) -> Result<JsonValue> 
                 cleaned
             );
             for cap in tag_re.captures_iter(&cleaned) {
-                let tag = &cap[0][1..]; // Remove '#'
+                let tag = &cap[0][1..];
                 debug!("Line {}: Found inline tag: {}", line_num + 1, tag);
                 if !tags.contains(&tag.to_string()) {
                     tags.push(tag.to_string());
@@ -555,8 +565,6 @@ fn process_file_json_only(file_path: &str, base_dir: &str) -> Result<JsonValue> 
         }
     }
 
-    // Process backlinks
-    debug!("Processing backlinks");
     let content = clearfromusless(fs::read_to_string(&canonical_path)?);
     let backlink_re = Regex::new(r"\[\[([^\]\[]+?)\]\]").unwrap();
     let mut backlinks = Vec::new();
@@ -567,19 +575,8 @@ fn process_file_json_only(file_path: &str, base_dir: &str) -> Result<JsonValue> 
         if let Some(sanitized_backlink) = sanitized {
             debug!("Sanitized backlink: {}", sanitized_backlink);
             backlinks.push(sanitized_backlink);
-        } else {
-            debug!("Skipped backlink due to invalid sanitization: {}", backlink);
         }
     }
-
-    // Build JSON output
-    let metadata = if !yaml_content.trim().is_empty() {
-        parse_yaml_frontmatter(&yaml_content, &mut Vec::new())
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or(JsonValue::Object(serde_json::Map::new()))
-    } else {
-        JsonValue::Object(serde_json::Map::new())
-    };
 
     let json_output = serde_json::json!({
         "file": {
@@ -596,18 +593,50 @@ fn process_file_json_only(file_path: &str, base_dir: &str) -> Result<JsonValue> 
     Ok(json_output)
 }
 
+fn remove_file_from_db(conn: &Connection, file_path: &str, base_dir: &str) -> Result<()> {
+    let file_name = Path::new(file_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| {
+            AppError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid file name",
+            ))
+        })?;
+    let relative_path = remove_string(file_path, base_dir);
+    debug!(
+        "File path: {}, Relative path: {}, File name: {}",
+        file_path, relative_path, file_name
+    );
+
+    // Delete the file—cascades handle file_tags and backlinks
+    let files_deleted =
+        conn.execute("DELETE FROM files WHERE path = ?1", params![relative_path])?;
+
+    debug!(
+        "Deleted {} file(s) (cascades cleaned related data)",
+        files_deleted
+    );
+
+    if files_deleted == 0 {
+        return Err(AppError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "File not found in DB",
+        )));
+    }
+
+    Ok(())
+}
 // Helper function to parse YAML frontmatter and extract tags
 fn parse_yaml_frontmatter(yaml_str: &str, yaml_tags: &mut Vec<String>) -> Option<String> {
     if yaml_str.trim().is_empty() {
         return None;
     }
 
-    // Clear any existing tags from this YAML block
     let mut block_tags = Vec::new();
     let mut in_tags = false;
     let lines: Vec<&str> = yaml_str.lines().collect();
 
-    // First, extract tags from this YAML block
     for line in &lines {
         let line = line.trim();
         if line.starts_with("tags:") {
@@ -621,24 +650,19 @@ fn parse_yaml_frontmatter(yaml_str: &str, yaml_tags: &mut Vec<String>) -> Option
         }
     }
 
-    // Add block tags to the overall list (avoid duplicates)
     for tag in block_tags {
         if !yaml_tags.contains(&tag) {
             yaml_tags.push(tag);
         }
     }
 
-    // Now try to parse the YAML
     match YamlLoader::load_from_str(yaml_str) {
         Ok(yaml_docs) => {
             if let Some(yaml) = yaml_docs.get(0) {
                 match yaml_to_json(yaml) {
                     Ok(json_value) => match serde_json::to_string(&json_value) {
                         Ok(metadata_json) => {
-                            debug!(
-                                "Successfully parsed YAML frontmatter to JSON: {}",
-                                metadata_json
-                            );
+                            debug!("Parsed YAML to JSON: {}", metadata_json);
                             Some(metadata_json)
                         }
                         Err(e) => {
@@ -647,7 +671,7 @@ fn parse_yaml_frontmatter(yaml_str: &str, yaml_tags: &mut Vec<String>) -> Option
                         }
                     },
                     Err(e) => {
-                        debug!("Failed to convert YAML to JSON: {}", e);
+                        debug!("Failed to convert YAML to JSON: {:?}", e);
                         None
                     }
                 }
@@ -657,12 +681,7 @@ fn parse_yaml_frontmatter(yaml_str: &str, yaml_tags: &mut Vec<String>) -> Option
             }
         }
         Err(e) => {
-            debug!(
-                "Failed to parse YAML frontmatter: {} at {:?}",
-                e,
-                e.marker()
-            );
-            // Log the problematic YAML content for debugging
+            debug!("Failed to parse YAML: {} at {:?}", e, e.marker());
             debug!("Problematic YAML content: {}", yaml_str);
             None
         }
@@ -804,7 +823,7 @@ fn clearfromtrashtags(input: &str) -> String {
     let re_parens = Regex::new(r"\(.*?\)").unwrap();
     let re_code = Regex::new(r"`.*?`").unwrap();
     let re_urls = Regex::new(r"https?://[\w\.\-\_/\%#]+").unwrap();
-    let re_angles = Regex::new(r"<.*?>").unwrap();
+    let re_angles = Regex::new(r"<[^>]+>[^<]*</[^>]+>").unwrap(); // Match tag and content
 
     let result = re_angles
         .replace_all(
@@ -825,13 +844,18 @@ fn clearfromtrashtags(input: &str) -> String {
 fn clearfromusless(input: String) -> String {
     let re_code = Regex::new(r"`.*?`").unwrap();
     let re_urls = Regex::new(r"https?://[\w\.\-\_/\%#]+").unwrap();
-    let re_angles = Regex::new(r"<.*?>").unwrap();
+    let re_angles = Regex::new(r"<[^>]+>[^<]*</[^>]+>").unwrap();
+    let re_spaces = Regex::new(r"\s+").unwrap();
 
-    let result = re_angles
+    let result = re_spaces
         .replace_all(
-            &re_urls.replace_all(&re_code.replace_all(&input, ""), " "),
-            "",
+            &re_angles.replace_all(
+                &re_urls.replace_all(&re_code.replace_all(&input, ""), " "),
+                "",
+            ),
+            " ",
         )
+        .trim()
         .to_string();
     debug!("Cleaned content for backlinks: result={}", result);
     result
@@ -860,12 +884,12 @@ fn sanitize_backlink(backlink: &str) -> Option<String> {
         );
         result = result[..idx].to_string();
     }
-
-    let sanitized_filename = result.replace("\'", "\'\'");
-    let final_result = if !sanitized_filename.contains('.') {
-        format!("{}.md", sanitized_filename)
+    // let sanitized_filename = result.replace("\'", "\'\'"); REMEMBER NOT DO TO THAT. THIS IS NOT LUA.
+    // Do not escape single quotes here; handle escaping in SQL queries directly
+    let final_result = if !result.contains('.') {
+        format!("{}.md", result)
     } else {
-        sanitized_filename
+        result
     };
 
     debug!(
@@ -1015,38 +1039,41 @@ fn find_backlink_file(
 
     // Fallback: search base_dir filesystem
     debug!("Searching filesystem for backlink file: {}", filename);
-    let mut matches: Vec<PathBuf> = WalkDir::new(base_dir)
+    let mut matches: Vec<(PathBuf, String, String)> = WalkDir::new(base_dir)
         .parallelism(jwalk::Parallelism::RayonNewPool(0))
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.path().file_name().and_then(|s| s.to_str()) == Some(filename))
-        .map(|e| e.path().to_path_buf())
+        .map(|e| {
+            let path = e.path().to_path_buf();
+            let relative_path = remove_string(&path.to_string_lossy(), base_dir);
+            let folder_path = path
+                .parent()
+                .map(|p| {
+                    if p == Path::new(base_dir) {
+                        "".to_string()
+                    } else {
+                        remove_string(&p.to_string_lossy(), base_dir)
+                    }
+                })
+                .unwrap_or_default();
+            (path, relative_path, folder_path)
+        })
         .collect();
 
-    for path in &matches {
-        debug!("Found file in filesystem: {}", path.display());
+    for (path, relative_path, folder_path) in &matches {
+        debug!(
+            "Found file in filesystem: path={}, relative_path={}, folder_path={}",
+            path.display(),
+            relative_path,
+            folder_path
+        );
     }
 
-    matches.sort_by(|a, b| a.to_string_lossy().len().cmp(&b.to_string_lossy().len()));
+    matches.sort_by(|a, b| a.1.len().cmp(&b.1.len()));
 
-    if let Some(matching_file) = matches.first() {
-        let folder_path = matching_file
-            .parent()
-            .map(|p| {
-                if p == Path::new(base_dir) {
-                    "".to_string() // Root directory
-                } else {
-                    remove_string(&p.to_string_lossy(), base_dir)
-                }
-            })
-            .unwrap_or_default();
-        let relative_path = remove_string(&matching_file.to_string_lossy(), base_dir);
-        debug!(
-            "Found file in filesystem: path={}, folder_path={}",
-            relative_path, folder_path
-        );
+    if let Some((_matching_file, relative_path, folder_path)) = matches.first() {
         let new_folder_id = insert_folder(conn, &folder_path)?;
-
         // Check if an existing entry needs to be updated
         let existing_id: Option<i64> = conn
             .query_row(
@@ -1078,12 +1105,511 @@ fn find_backlink_file(
             "Inserted/Updated backlink file: id={}, path={}",
             backlink_id, relative_path
         );
-        Ok((Some(backlink_id), Some(relative_path)))
+        Ok((Some(backlink_id), Some(relative_path.clone())))
     } else {
         debug!(
             "No file found for backlink: {}. Skipping backlink insertion.",
             filename
         );
         Ok((None, None))
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+    use std::fs::File;
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    fn setup_test_db() -> Result<Connection> {
+        let conn = Connection::open_in_memory()?;
+        setup_database(&conn)?;
+        Ok(conn)
+    }
+
+    fn create_temp_md_file(content: &str, file_name: &str) -> Result<(TempDir, String)> {
+        let dir = TempDir::new()?;
+        let file_path = dir.path().join(file_name);
+        let mut file = File::create(&file_path)?;
+        write!(file, "{}", content)?;
+        Ok((dir, file_path.to_string_lossy().into_owned()))
+    }
+
+    fn get_table_count(conn: &Connection, table: &str) -> Result<i64> {
+        let count: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |row| {
+            row.get(0)
+        })?;
+        Ok(count)
+    }
+
+    #[test]
+    fn test_setup_database() {
+        let conn = setup_test_db().unwrap();
+        let tables = ["folders", "files", "tags", "file_tags", "backlinks"];
+        for table in &tables {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "Table {} should exist", table);
+        }
+        let mut stmt = conn.prepare("PRAGMA table_info(files)").unwrap();
+        let columns: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(columns.contains(&"metadata".to_string()));
+    }
+
+    #[test]
+    fn test_insert_folder() {
+        let conn = setup_test_db().unwrap();
+        let folder_id = insert_folder(&conn, "/test/folder").unwrap();
+        assert!(folder_id > 0);
+        let count = get_table_count(&conn, "folders").unwrap();
+        assert_eq!(count, 1);
+        let path: String = conn
+            .query_row(
+                "SELECT path FROM folders WHERE id = ?",
+                params![folder_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(path, "/test/folder");
+    }
+
+    #[test]
+    fn test_insert_file() {
+        let conn = setup_test_db().unwrap();
+        let folder_id = insert_folder(&conn, "/test").unwrap();
+        let file_id = insert_file(&conn, "test.md", "test.md", folder_id).unwrap();
+        let count = get_table_count(&conn, "files").unwrap();
+        assert_eq!(count, 1);
+        let (path, fname, fid): (String, String, i64) = conn
+            .query_row(
+                "SELECT path, file_name, folder_id FROM files WHERE id = ?",
+                params![file_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(path, "test.md");
+        assert_eq!(fname, "test.md");
+        assert_eq!(fid, folder_id);
+    }
+
+    #[test]
+    fn test_insert_tag_and_file_tag() {
+        let conn = setup_test_db().unwrap();
+        let folder_id = insert_folder(&conn, "/test").unwrap();
+        let file_id = insert_file(&conn, "test.md", "test.md", folder_id).unwrap();
+        let tag_id = insert_tag(&conn, "mytag").unwrap();
+        insert_file_tag(&conn, file_id, tag_id).unwrap();
+        let count = get_table_count(&conn, "tags").unwrap();
+        assert_eq!(count, 1);
+        let count = get_table_count(&conn, "file_tags").unwrap();
+        assert_eq!(count, 1);
+        let tag: String = conn
+            .query_row(
+                "SELECT tag FROM tags WHERE id = ?",
+                params![tag_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tag, "mytag");
+        let ft: (i64, i64) = conn
+            .query_row(
+                "SELECT file_id, tag_id FROM file_tags WHERE file_id = ? AND tag_id = ?",
+                params![file_id, tag_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(ft, (file_id, tag_id));
+    }
+
+    #[test]
+    fn test_remove_file_from_db() {
+        let conn = setup_test_db().unwrap();
+        let folder_id = insert_folder(&conn, "/test").unwrap();
+        let file_id = insert_file(&conn, "test.md", "test.md", folder_id).unwrap();
+        let tag_id = insert_tag(&conn, "mytag").unwrap();
+        insert_file_tag(&conn, file_id, tag_id).unwrap();
+        let backlink_file_id = insert_file(&conn, "other.md", "other.md", folder_id).unwrap();
+        conn.execute(
+            "INSERT INTO backlinks (backlink, backlink_id, file_id) VALUES (?, ?, ?)",
+            params!["other.md", backlink_file_id, file_id],
+        )
+        .unwrap();
+        assert_eq!(get_table_count(&conn, "files").unwrap(), 2);
+        assert_eq!(get_table_count(&conn, "file_tags").unwrap(), 1);
+        assert_eq!(get_table_count(&conn, "backlinks").unwrap(), 1);
+        remove_file_from_db(&conn, "test.md", "/test").unwrap();
+        assert_eq!(get_table_count(&conn, "files").unwrap(), 1);
+        assert_eq!(get_table_count(&conn, "file_tags").unwrap(), 0);
+        assert_eq!(get_table_count(&conn, "backlinks").unwrap(), 0);
+        assert_eq!(get_table_count(&conn, "tags").unwrap(), 1);
+        assert_eq!(get_table_count(&conn, "folders").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_remove_file_from_db_not_found() {
+        let conn = setup_test_db().unwrap();
+        let result = remove_file_from_db(&conn, "nonexistent.md", "/test");
+        assert!(matches!(
+            result,
+            Err(AppError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+
+    #[test]
+    fn test_process_file_yaml_and_tags() {
+        let conn = setup_test_db().unwrap();
+        let (dir, file_path) = create_temp_md_file(
+            r#"
+---
+title: Test Doc
+tags:
+  - tag1
+  - tag2
+---
+# Hello
+This is a #testtag.
+"#,
+            "test.md",
+        )
+        .unwrap();
+        let base_dir = dir.path().to_string_lossy().into_owned();
+        process_file(&conn, &file_path, &base_dir).unwrap();
+        let file_id: i64 = conn
+            .query_row(
+                "SELECT id FROM files WHERE path = ?",
+                params!["test.md"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let metadata: String = conn
+            .query_row(
+                "SELECT metadata FROM files WHERE id = ?",
+                params![file_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&metadata).unwrap();
+        assert_eq!(json["title"], "Test Doc");
+        assert_eq!(json["tags"], serde_json::json!(["tag1", "tag2"]));
+        let tags: Vec<String> = conn
+            .query_row(
+                "SELECT GROUP_CONCAT(tag) FROM tags JOIN file_tags ON tags.id = file_tags.tag_id WHERE file_tags.file_id = ?",
+                params![file_id],
+                |row| row.get(0),
+            )
+            .map(|s: String| s.split(',').map(String::from).collect())
+            .unwrap();
+        assert_eq!(tags.len(), 3);
+        assert!(tags.contains(&"tag1".to_string()));
+        assert!(tags.contains(&"tag2".to_string()));
+        assert!(tags.contains(&"testtag".to_string()));
+    }
+
+    #[test]
+    fn test_process_file_backlinks() {
+        let conn = setup_test_db().unwrap();
+        let (dir, file_path) = create_temp_md_file(
+            r#"
+---
+title: Test Doc
+---
+Link to [[other.md]].
+"#,
+            "test.md",
+        )
+        .unwrap();
+        let base_dir = dir.path().to_string_lossy().into_owned();
+        let folder_id = insert_folder(&conn, "").unwrap();
+        let backlink_id = insert_file(&conn, "other.md", "other.md", folder_id).unwrap();
+        File::create(dir.path().join("other.md")).unwrap();
+        process_file(&conn, &file_path, &base_dir).unwrap();
+        let file_id: i64 = conn
+            .query_row(
+                "SELECT id FROM files WHERE path = ?",
+                params!["test.md"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let backlink: (String, i64) = conn
+            .query_row(
+                "SELECT backlink, backlink_id FROM backlinks WHERE file_id = ?",
+                params![file_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(backlink.0, "other.md");
+        assert_eq!(backlink.1, backlink_id);
+    }
+
+    #[test]
+    fn test_process_file_json_only() {
+        let (dir, file_path) = create_temp_md_file(
+            r#"
+---
+title: Test Doc
+tags:
+  - tag1
+  - tag2
+---
+# Hello
+This is a #testtag.
+Link to [[other.md]].
+"#,
+            "test.md",
+        )
+        .unwrap();
+        let base_dir = dir.path().to_string_lossy().into_owned();
+        let result = process_file_json_only(&file_path, &base_dir).unwrap();
+        assert_eq!(result["file"]["path"], "test.md");
+        assert_eq!(result["file"]["file_name"], "test.md");
+        assert_eq!(result["metadata"]["title"], "Test Doc");
+        assert_eq!(
+            result["tags"],
+            serde_json::json!(["tag1", "tag2", "testtag"])
+        );
+        assert_eq!(result["backlinks"], serde_json::json!(["other.md"]));
+    }
+
+    #[test]
+    fn test_remove_string() {
+        let result = remove_string("/base/test/file.md", "/base");
+        assert_eq!(result, "test/file.md");
+        let result = remove_string("/base/file.md", "/base");
+        assert_eq!(result, "file.md");
+        let result = remove_string("/base/file.md", "/other");
+        assert_eq!(result, "base/file.md");
+    }
+
+    #[test]
+    fn test_clearfromtrashtags() {
+        let input ="Text [link]<a href=\"http://example.com\" target=\"_blank\" rel=\"noopener noreferrer nofollow\"></a> `code` #tag1 <b>bold</b>";
+        let result = clearfromtrashtags(input);
+        assert_eq!(result, "Text   #tag1 ");
+        let input = "#tag1 in code `use #tag2`";
+        let result = clearfromtrashtags(input);
+        assert_eq!(result, "#tag1 in code ");
+    }
+
+    #[test]
+    fn test_clearfromusless() {
+        let input = "Text `code` http://example.com <b>bold</b>";
+        let result = clearfromusless(input.to_string());
+        assert_eq!(result, "Text"); // Expect no trailing space
+    }
+
+    #[test]
+    fn test_sanitize_backlink() {
+        assert_eq!(sanitize_backlink("file").unwrap(), "file.md");
+        assert_eq!(sanitize_backlink("file.md").unwrap(), "file.md");
+        assert_eq!(sanitize_backlink("file#section").unwrap(), "file.md");
+        assert_eq!(sanitize_backlink("file|alias").unwrap(), "file.md");
+        assert_eq!(sanitize_backlink("file's").unwrap(), "file's.md"); //yes no doubling down
+        assert_eq!(sanitize_backlink(""), None);
+    }
+
+    #[test]
+    fn test_yaml_to_json() {
+        let yaml = YamlLoader::load_from_str(
+            r#"
+title: Test Doc
+tags:
+  - tag1
+  - tag2
+number: 42
+"#,
+        )
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+        let json = yaml_to_json(&yaml).unwrap();
+        assert_eq!(json["title"], "Test Doc");
+        assert_eq!(json["tags"], serde_json::json!(["tag1", "tag2"]));
+        assert_eq!(json["number"], 42);
+    }
+
+    #[test]
+    fn test_find_backlink_file() {
+        let conn = setup_test_db().unwrap();
+        let (dir, _file_path) = create_temp_md_file("", "test.md").unwrap();
+        let base_dir = dir.path().to_string_lossy().into_owned();
+        let folder_id = insert_folder(&conn, "").unwrap();
+        let file_id = insert_file(&conn, "other.md", "other.md", folder_id).unwrap();
+        File::create(dir.path().join("other.md")).unwrap();
+        let (backlink_id, backlink_path) =
+            find_backlink_file(&conn, "other.md", &base_dir, "test.md", folder_id).unwrap();
+        assert_eq!(backlink_id, Some(file_id));
+        assert_eq!(backlink_path, Some("other.md".to_string()));
+    }
+
+    #[test]
+    fn test_parse_yaml_frontmatter() {
+        let mut tags = Vec::new();
+        let yaml = r#"
+title: Test Doc
+tags:
+  - tag1
+  - tag2
+"#;
+        let result = parse_yaml_frontmatter(yaml, &mut tags).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(json["title"], "Test Doc");
+        assert_eq!(tags, vec!["tag1", "tag2"]);
+    }
+
+    #[test]
+    fn test_process_file_with_single_quote_in_name() {
+        let conn = setup_test_db().unwrap();
+        // Create a file with a single quote in its name
+        let (dir, file_path) = create_temp_md_file(
+            r#"
+---
+title: Test Doc
+tags:
+  - tag1
+  - tag2
+---
+# Hello
+This is a #testtag.
+Link to [[other.md]].
+"#,
+            "O'Reilly.md",
+        )
+        .unwrap();
+        let base_dir = dir.path().to_string_lossy().into_owned();
+
+        // Create a referenced backlink file
+        File::create(dir.path().join("other.md")).unwrap();
+
+        // Process the file
+        process_file(&conn, &file_path, &base_dir).unwrap();
+
+        // Verify file entry in the database
+        let file_id: i64 = conn
+            .query_row(
+                "SELECT id FROM files WHERE path = ?",
+                params!["O'Reilly.md"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(file_id > 0, "File should be inserted with a valid ID");
+
+        // Verify file metadata
+        let metadata: String = conn
+            .query_row(
+                "SELECT metadata FROM files WHERE id = ?",
+                params![file_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&metadata).unwrap();
+        assert_eq!(json["title"], "Test Doc", "Metadata title should match");
+        assert_eq!(
+            json["tags"],
+            serde_json::json!(["tag1", "tag2"]),
+            "Metadata tags should match"
+        );
+
+        // Verify tags
+        let tags: Vec<String> = conn
+            .query_row(
+                "SELECT GROUP_CONCAT(tag) FROM tags JOIN file_tags ON tags.id = file_tags.tag_id WHERE file_tags.file_id = ?",
+                params![file_id],
+                |row| row.get(0),
+            )
+            .map(|s: String| s.split(',').map(String::from).collect())
+            .unwrap();
+        assert_eq!(tags.len(), 3, "Should have three tags");
+        assert!(tags.contains(&"tag1".to_string()), "Should contain tag1");
+        assert!(tags.contains(&"tag2".to_string()), "Should contain tag2");
+        assert!(
+            tags.contains(&"testtag".to_string()),
+            "Should contain testtag"
+        );
+
+        // Verify folder
+        let folder_id: i64 = conn
+            .query_row(
+                "SELECT folder_id FROM files WHERE id = ?",
+                params![file_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let folder_path: String = conn
+            .query_row(
+                "SELECT path FROM folders WHERE id = ?",
+                params![folder_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(folder_path, "/", "Folder path should be root");
+
+        // Verify backlink
+        let backlink_id: i64 = conn
+            .query_row(
+                "SELECT id FROM files WHERE path = ?",
+                params!["other.md"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let backlink: (String, i64) = conn
+            .query_row(
+                "SELECT backlink, backlink_id FROM backlinks WHERE file_id = ?",
+                params![file_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(backlink.0, "other.md", "Backlink name should match");
+        assert_eq!(
+            backlink.1, backlink_id,
+            "Backlink ID should match the linked file"
+        );
+
+        // Test JSON-only mode
+        let json_result = process_file_json_only(&file_path, &base_dir).unwrap();
+        assert_eq!(
+            json_result["file"]["path"], "O'Reilly.md",
+            "JSON path should match"
+        );
+        assert_eq!(
+            json_result["file"]["file_name"], "O'Reilly.md",
+            "JSON file name should match"
+        );
+        assert_eq!(
+            json_result["metadata"]["title"], "Test Doc",
+            "JSON metadata title should match"
+        );
+        assert_eq!(
+            json_result["tags"],
+            serde_json::json!(["tag1", "tag2", "testtag"]),
+            "JSON tags should match"
+        );
+        assert_eq!(
+            json_result["backlinks"],
+            serde_json::json!(["other.md"]),
+            "JSON backlinks should match"
+        );
+
+        // Test removing file from database
+        remove_file_from_db(&conn, &file_path, &base_dir).unwrap();
+        let file_count = get_table_count(&conn, "files").unwrap();
+        assert_eq!(
+            file_count, 1,
+            "Only the backlink file (other.md) should remain"
+        );
+        let file_tags_count = get_table_count(&conn, "file_tags").unwrap();
+        assert_eq!(file_tags_count, 0, "File tags should be removed");
+        let backlinks_count = get_table_count(&conn, "backlinks").unwrap();
+        assert_eq!(backlinks_count, 0, "Backlinks should be removed");
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "markdown-scanner"
-version = "1.0.0"
+version = "1.0.2"
 edition = "2021"
 
 [[bin]]
@@ -22,6 +22,9 @@ env_logger = "0.10"
 
 serde_json = "1.0"
 # yaml-rust = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 panic = "abort"
