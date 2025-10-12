@@ -7,7 +7,7 @@ keywords = ["markdown", "sql"]
 categories = ["command-line-utilities"]
 description= " markdown-scanner is a Rust-based command-line tool designed to scan Markdown files within a specified directory in sqlite db."
 readme = "README.md"
-exclude = ["cheat sheet.md", "markdown-processor-all-rust.bash"]
+exclude = ["cheat sheet.md", "markdown-processor-all-rust.bash", ".github/*"]
 
 [dependencies]
 rusqlite = { version = "0.29", features = ["bundled"] }
