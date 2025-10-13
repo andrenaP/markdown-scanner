@@ -14,6 +14,10 @@
 ## Usage
 The tool is typically executed via the provided Bash script or directly as a command-line utility.
 
+### Progect that use markdown-scanner
+[nvim-minimal](https://github.com/andrenaP/nvim-minimal) 
+[midetor](https://github.com/andrenaP/midetor)
+
 ### Bash Script
 The `markdown-processor-all-rust.bash` script processes all `.md` files in a specified directory (e.g., an Obsidian vault):
 
