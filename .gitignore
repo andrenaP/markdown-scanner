@@ -2,3 +2,4 @@ target
 Cargo.toml.bak
 notes
 *.db
+Cargo.lock
