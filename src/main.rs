@@ -27,7 +27,7 @@ type Result<T> = std::result::Result<T, AppError>;
 fn main() -> Result<()> {
     env_logger::init();
     let matches = Command::new("markdown-scanner")
-        .version("0.1.0")
+        .version("0.1.4")
         .about("Scans Markdown files for tags and backlinks")
         .arg(
             Arg::new("file")
@@ -951,11 +951,19 @@ fn find_backlink_file(
         let path: String = row.get(1)?;
         let file_folder_id: i64 = row.get(2)?;
         let folder_path: String = row.get(3)?;
-        let full_path = Path::new(base_dir).join(&path);
         debug!(
             "Checking database match: id={}, path={}, folder_id={}, folder_path={}",
             id, path, file_folder_id, folder_path
         );
+
+        // __dangling__ entries as always valid
+        if folder_path == "/" {
+            debug!("Dangling link found, treating as valid: {}", path);
+            valid_matches.push((id, path, file_folder_id));
+            continue; // Skip the full_path.exists() check
+        }
+
+        let full_path = Path::new(base_dir).join(&path);
         if full_path.exists() {
             debug!("File exists at: {}", full_path.display());
             valid_matches.push((id, path, file_folder_id));
@@ -969,57 +977,63 @@ fn find_backlink_file(
     if valid_matches.len() == 1 {
         let (id, path, _) = valid_matches.into_iter().next().unwrap();
         debug!("Found single valid match: id={}, path={}", id, path);
+
+        // Delete all invalid matches, as they are orphans
+        for (invalid_id, invalid_path, _) in invalid_matches {
+            debug!(
+                "Removing invalid (orphan) file entry: id={}, path={}",
+                invalid_id, invalid_path
+            );
+            // Delete from files table, cascades will handle file_tags and backlinks
+            conn.execute("DELETE FROM files WHERE id = ?1", params![invalid_id])?;
+        }
+
         return Ok((Some(id), Some(path)));
     } else if valid_matches.len() > 1 {
         // Prefer match in the same folder, if available
-        if let Some(&(id, ref path, _)) =
+        let (id, path) = if let Some(&(id, ref path, _)) =
             valid_matches.iter().find(|&&(_, _, fid)| fid == folder_id)
         {
             debug!(
                 "Multiple matches found, selecting match in same folder: id={}, path={}",
                 id, path
             );
-            // Clean up other valid matches to avoid duplicates
-            for (other_id, _, _) in valid_matches.iter().filter(|&&(_id, _, _)| _id != id) {
-                debug!("Removing duplicate file entry: id={}", other_id);
-                conn.execute(
-                    "DELETE FROM backlinks WHERE file_id = ?1 OR backlink_id = ?1",
-                    params![other_id],
-                )?;
-                conn.execute(
-                    "DELETE FROM file_tags WHERE file_id = ?1",
-                    params![other_id],
-                )?;
-                conn.execute("DELETE FROM files WHERE id = ?1", params![other_id])?;
-            }
-            return Ok((Some(id), Some(path.clone())));
-        }
-        // Otherwise, select the shortest path
-        let &(id, ref path, _) = valid_matches
-            .iter()
-            .min_by_key(|&(_, ref path, _)| path.len())
-            .unwrap();
-        debug!(
-            "Multiple matches found, selecting shortest path: id={}, path={}",
-            id, path
-        );
-        // Clean up other valid matches to avoid duplicates
-        for (other_id, _, _) in valid_matches.iter().filter(|&&(_id, _, _)| _id != id) {
-            debug!("Removing duplicate file entry: id={}", other_id);
-            conn.execute(
-                "DELETE FROM backlinks WHERE file_id = ?1 OR backlink_id = ?1",
-                params![other_id],
-            )?;
-            conn.execute(
-                "DELETE FROM file_tags WHERE file_id = ?1",
-                params![other_id],
-            )?;
+            (id, path.clone())
+        } else {
+            // Otherwise, select the shortest path
+            let &(id, ref path, _) = valid_matches
+                .iter()
+                .min_by_key(|&(_, ref path, _)| path.len())
+                .unwrap();
+            debug!(
+                "Multiple matches found, selecting shortest path: id={}, path={}",
+                id, path
+            );
+            (id, path.clone())
+        };
+
+        // Clean up other valid matches (duplicates)
+        for (other_id, other_path, _) in valid_matches.iter().filter(|&&(_id, _, _)| _id != id) {
+            debug!(
+                "Removing duplicate valid file entry: id={}, path={}",
+                other_id, other_path
+            );
             conn.execute("DELETE FROM files WHERE id = ?1", params![other_id])?;
         }
-        return Ok((Some(id), Some(path.clone())));
+
+        // Delete all invalid matches
+        for (invalid_id, invalid_path, _) in invalid_matches {
+            debug!(
+                "Removing invalid (orphan) file entry: id={}, path={}",
+                invalid_id, invalid_path
+            );
+            conn.execute("DELETE FROM files WHERE id = ?1", params![invalid_id])?;
+        }
+
+        return Ok((Some(id), Some(path)));
     }
 
-    // Clean up invalid matches
+    // No valid matches found, clean up all invalid matches
     if !invalid_matches.is_empty() {
         debug!(
             "Found {} invalid database entries for file_name={}",
@@ -1028,11 +1042,7 @@ fn find_backlink_file(
         );
         for (id, path, _) in invalid_matches {
             debug!("Removing invalid file entry: id={}, path={}", id, path);
-            conn.execute(
-                "DELETE FROM backlinks WHERE file_id = ?1 OR backlink_id = ?1",
-                params![id],
-            )?;
-            conn.execute("DELETE FROM file_tags WHERE file_id = ?1", params![id])?;
+            // Deleting from 'files' will cascade to file_tags and backlinks
             conn.execute("DELETE FROM files WHERE id = ?1", params![id])?;
         }
     }
@@ -1074,7 +1084,7 @@ fn find_backlink_file(
 
     if let Some((_matching_file, relative_path, folder_path)) = matches.first() {
         let new_folder_id = insert_folder(conn, &folder_path)?;
-        // Check if an existing entry needs to be updated
+
         let existing_id: Option<i64> = conn
             .query_row(
                 "SELECT id FROM files WHERE file_name = ?1",
@@ -1085,7 +1095,7 @@ fn find_backlink_file(
 
         let backlink_id = if let Some(id) = existing_id {
             debug!(
-                "Updating existing file entry: id={}, path={}, folder_id={}",
+                "Updating existing file entry (found via FS search): id={}, path={}, folder_id={}",
                 id, relative_path, new_folder_id
             );
             conn.execute(
@@ -1095,7 +1105,7 @@ fn find_backlink_file(
             id
         } else {
             debug!(
-                "Inserting new file: path={}, file_name={}, folder_id={}",
+                "Inserting new file (found via FS search): path={}, file_name={}, folder_id={}",
                 relative_path, filename, new_folder_id
             );
             insert_file(conn, &relative_path, filename, new_folder_id)?
@@ -1108,10 +1118,24 @@ fn find_backlink_file(
         Ok((Some(backlink_id), Some(relative_path.clone())))
     } else {
         debug!(
-            "No file found for backlink: {}. Skipping backlink insertion.",
-            filename
+            "No file found for backlink: {}. Creating placeholder.",
+            backlink
         );
-        Ok((None, None))
+
+        // Use a special path: e.g., "__dangling__/file.md"
+        let placeholder_path = format!("{}.md", backlink.trim_end_matches(".md"));
+        let placeholder_folder_path = "";
+
+        let placeholder_folder_id = insert_folder(conn, placeholder_folder_path)?;
+        let placeholder_file_id =
+            insert_file(conn, &placeholder_path, filename, placeholder_folder_id)?;
+
+        debug!(
+            "Created placeholder file: id={}, path={}",
+            placeholder_file_id, placeholder_path
+        );
+
+        return Ok((Some(placeholder_file_id), Some(placeholder_path)));
     }
 }
 #[cfg(test)]
@@ -1128,12 +1152,11 @@ mod tests {
         Ok(conn)
     }
 
-    fn create_temp_md_file(content: &str, file_name: &str) -> Result<(TempDir, String)> {
-        let dir = TempDir::new()?;
+    fn create_temp_md_file(dir: &TempDir, content: &str, file_name: &str) -> Result<String> {
         let file_path = dir.path().join(file_name);
         let mut file = File::create(&file_path)?;
         write!(file, "{}", content)?;
-        Ok((dir, file_path.to_string_lossy().into_owned()))
+        Ok(file_path.to_string_lossy().into_owned())
     }
 
     fn get_table_count(conn: &Connection, table: &str) -> Result<i64> {
@@ -1264,11 +1287,12 @@ mod tests {
             Err(AppError::Io(ref e)) if e.kind() == std::io::ErrorKind::NotFound
         ));
     }
-
     #[test]
     fn test_process_file_yaml_and_tags() {
         let conn = setup_test_db().unwrap();
-        let (dir, file_path) = create_temp_md_file(
+        let dir = TempDir::new().unwrap();
+        let file_path = create_temp_md_file(
+            &dir,
             r#"
 ---
 title: Test Doc
@@ -1307,18 +1331,22 @@ This is a #testtag.
                 params![file_id],
                 |row| row.get(0),
             )
-            .map(|s: String| s.split(',').map(String::from).collect())
+            .map(|s: String| {
+                let mut v: Vec<String> = s.split(',').map(String::from).collect();
+                v.sort();
+                v
+            })
             .unwrap();
         assert_eq!(tags.len(), 3);
-        assert!(tags.contains(&"tag1".to_string()));
-        assert!(tags.contains(&"tag2".to_string()));
-        assert!(tags.contains(&"testtag".to_string()));
+        assert_eq!(tags, vec!["tag1", "tag2", "testtag"]);
     }
 
     #[test]
     fn test_process_file_backlinks() {
         let conn = setup_test_db().unwrap();
-        let (dir, file_path) = create_temp_md_file(
+        let dir = TempDir::new().unwrap();
+        let file_path = create_temp_md_file(
+            &dir,
             r#"
 ---
 title: Test Doc
@@ -1330,8 +1358,11 @@ Link to [[other.md]].
         .unwrap();
         let base_dir = dir.path().to_string_lossy().into_owned();
         let folder_id = insert_folder(&conn, "").unwrap();
+        // Create the backlink file on disk
+        create_temp_md_file(&dir, "This is other.md", "other.md").unwrap();
+        // Insert the backlink file into the DB *before* processing
         let backlink_id = insert_file(&conn, "other.md", "other.md", folder_id).unwrap();
-        File::create(dir.path().join("other.md")).unwrap();
+
         process_file(&conn, &file_path, &base_dir).unwrap();
         let file_id: i64 = conn
             .query_row(
@@ -1353,7 +1384,9 @@ Link to [[other.md]].
 
     #[test]
     fn test_process_file_json_only() {
-        let (dir, file_path) = create_temp_md_file(
+        let dir = TempDir::new().unwrap();
+        let file_path = create_temp_md_file(
+            &dir,
             r#"
 ---
 title: Test Doc
@@ -1439,17 +1472,28 @@ number: 42
     }
 
     #[test]
-    fn test_find_backlink_file() {
+    fn test_find_backlink_file_filesystem_search() {
         let conn = setup_test_db().unwrap();
-        let (dir, _file_path) = create_temp_md_file("", "test.md").unwrap();
+        let dir = TempDir::new().unwrap();
         let base_dir = dir.path().to_string_lossy().into_owned();
         let folder_id = insert_folder(&conn, "").unwrap();
-        let file_id = insert_file(&conn, "other.md", "other.md", folder_id).unwrap();
-        File::create(dir.path().join("other.md")).unwrap();
+        // Create the backlink file on disk
+        create_temp_md_file(&dir, "This is other.md", "other.md").unwrap();
+        // Do NOT insert it into the DB
         let (backlink_id, backlink_path) =
             find_backlink_file(&conn, "other.md", &base_dir, "test.md", folder_id).unwrap();
-        assert_eq!(backlink_id, Some(file_id));
+        assert!(backlink_id.is_some());
+        let new_id = backlink_id.unwrap();
         assert_eq!(backlink_path, Some("other.md".to_string()));
+        let (path, fname): (String, String) = conn
+            .query_row(
+                "SELECT path, file_name FROM files WHERE id = ?",
+                params![new_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(path, "other.md");
+        assert_eq!(fname, "other.md");
     }
 
     #[test]
@@ -1470,8 +1514,10 @@ tags:
     #[test]
     fn test_process_file_with_single_quote_in_name() {
         let conn = setup_test_db().unwrap();
+        let dir = TempDir::new().unwrap();
         // Create a file with a single quote in its name
-        let (dir, file_path) = create_temp_md_file(
+        let file_path = create_temp_md_file(
+            &dir,
             r#"
 ---
 title: Test Doc
@@ -1489,7 +1535,7 @@ Link to [[other.md]].
         let base_dir = dir.path().to_string_lossy().into_owned();
 
         // Create a referenced backlink file
-        File::create(dir.path().join("other.md")).unwrap();
+        create_temp_md_file(&dir, "Other file", "other.md").unwrap();
 
         // Process the file
         process_file(&conn, &file_path, &base_dir).unwrap();
@@ -1527,15 +1573,14 @@ Link to [[other.md]].
                 params![file_id],
                 |row| row.get(0),
             )
-            .map(|s: String| s.split(',').map(String::from).collect())
+            .map(|s: String| {
+                let mut v: Vec<String> = s.split(',').map(String::from).collect();
+                v.sort();
+                v
+            })
             .unwrap();
         assert_eq!(tags.len(), 3, "Should have three tags");
-        assert!(tags.contains(&"tag1".to_string()), "Should contain tag1");
-        assert!(tags.contains(&"tag2".to_string()), "Should contain tag2");
-        assert!(
-            tags.contains(&"testtag".to_string()),
-            "Should contain testtag"
-        );
+        assert_eq!(tags, vec!["tag1", "tag2", "testtag"]);
 
         // Verify folder
         let folder_id: i64 = conn
@@ -1611,5 +1656,53 @@ Link to [[other.md]].
         assert_eq!(file_tags_count, 0, "File tags should be removed");
         let backlinks_count = get_table_count(&conn, "backlinks").unwrap();
         assert_eq!(backlinks_count, 0, "Backlinks should be removed");
+    }
+
+    #[test]
+    fn test_backlink_to_nonexistent_file() {
+        let conn = setup_test_db().unwrap();
+        let dir = TempDir::new().unwrap();
+        let base_dir = dir.path().to_string_lossy().into_owned();
+
+        let file_path =
+            create_temp_md_file(&dir, "Link to [[nonexistentfile.md]].", "test.md").unwrap();
+
+        process_file(&conn, &file_path, &base_dir).unwrap();
+
+        let file_id: i64 = conn
+            .query_row(
+                "SELECT id FROM files WHERE path = ?",
+                params!["test.md"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(file_id > 0);
+
+        // The logic creates a path from the backlink name
+        let placeholder_path = "nonexistentfile.md";
+        let placeholder_id: i64 = conn
+            .query_row(
+                "SELECT id FROM files WHERE path = ?",
+                params![placeholder_path],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(placeholder_id > 0);
+
+        let backlink: (String, i64) = conn
+            .query_row(
+                "SELECT backlink, backlink_id FROM backlinks WHERE file_id = ?",
+                params![file_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(backlink.0, "nonexistentfile.md");
+        assert_eq!(
+            backlink.1, placeholder_id,
+            "Backlink should point to the placeholder ID"
+        );
+
+        assert_eq!(get_table_count(&conn, "files").unwrap(), 2);
     }
 }
