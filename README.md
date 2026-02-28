@@ -11,6 +11,13 @@
 - **Error Handling**: Robust error handling with custom error types and detailed logging for debugging.
 - **Editor Integration**: Designed to be triggered on file save in editors like Neovim or used in batch processing for Markdown vaults.
 
+### Extra Features 
+- **YouTube Title Extraction**  
+  Automatically fetches and stores the video title in the database (as JSON) when a YouTube link is detected.
+- **File Creation Time Tracking**  
+  Stores the file creation timestamp when available.  
+  Falls back to modification time on filesystems that don't provide reliable birth/creation time (termux, etc.).
+
 ## Usage
 The tool is typically executed via the provided Bash script or directly as a command-line utility.
 
