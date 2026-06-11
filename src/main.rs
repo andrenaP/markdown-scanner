@@ -24,7 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
     let matches = Command::new("markdown-scanner")
-        .version("1.1.0")
+        .version("1.2.0")
         .arg(Arg::new("file").required(true))
         .arg(Arg::new("base_dir").required(true))
         .arg(

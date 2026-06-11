@@ -56,28 +56,29 @@ impl<'a> DatabaseRepo<'a> {
         tx.execute("DELETE FROM backlinks WHERE file_id = ?", params![file_id])?;
 
         // Tags
-        for tag in &data.tags {
+        for (order_idx, tag) in data.tags.iter().enumerate() {
             tx.execute("INSERT OR IGNORE INTO tags (tag) VALUES (?)", params![tag])?;
             let tag_id: i64 =
                 tx.query_row("SELECT id FROM tags WHERE tag = ?", params![tag], |r| {
                     r.get(0)
                 })?;
             tx.execute(
-                "INSERT INTO file_tags (file_id, tag_id) VALUES (?, ?)",
-                params![file_id, tag_id],
+                "INSERT INTO file_tags (file_id, tag_id, order_index) VALUES (?1, ?2, ?3)",
+                params![file_id, tag_id, order_idx as i64],
             )?;
         }
 
-        // Backlinks (Resolve Logic with Placeholders)
-        for link in &data.backlinks {
+        // Backlinks
+        // Use .enumerate() to get a 0-based index for the order
+        for (order_idx, link) in data.backlinks.iter().enumerate() {
             // pass the transaction so lookups/inserts happen in same context
             let (target_id, _) = find_backlink_target(&tx, link, &ctx.base_dir, folder_id)?;
 
             if let Some(tid) = target_id {
                 tx.execute(
-                    "INSERT INTO backlinks (backlink, backlink_id, file_id) VALUES (?1, ?2, ?3)",
-                    params![link, tid, file_id],
-                )?;
+                            "INSERT INTO backlinks (backlink, backlink_id, file_id, order_index) VALUES (?1, ?2, ?3, ?4)",
+                            params![link, tid, file_id, order_idx as i64],
+                        )?;
             }
         }
 

@@ -2,6 +2,7 @@ use crate::error::Result;
 use crate::models::{FileContext, ScanResult};
 use crate::scanners::Scanner;
 use async_trait::async_trait;
+use log::debug;
 use regex::Regex;
 use tokio::process::Command;
 
@@ -17,7 +18,7 @@ impl Scanner for YoutubeScanner {
 
         for cap in vid_re.captures_iter(&ctx.content) {
             let url = &cap[1];
-            println!("[DEBUG] 1. Regex matched URL: {}", url);
+            debug!("[DEBUG] 1. Regex matched URL: {}", url);
 
             // 1. Check if the URL already exists in our cached vidlinks
             let cached_title = ctx
@@ -28,7 +29,7 @@ impl Scanner for YoutubeScanner {
 
             // 2. Decide whether to use the cache or fetch a new one
             if let Some(title) = cached_title {
-                println!(
+                debug!(
                     "[DEBUG] Found URL in cache. Skipping wget. Title: {}",
                     title
                 );
@@ -37,10 +38,10 @@ impl Scanner for YoutubeScanner {
                     title,
                 });
             } else {
-                println!("[DEBUG] URL not found in cache. Fetching...");
+                debug!("[DEBUG] URL not found in cache. Fetching...");
                 match fetch_youtube_title_wget(url).await {
                     Some(title) => {
-                        println!("[DEBUG] Success! Title extracted: {}", title);
+                        debug!("[DEBUG] Success! Title extracted: {}", title);
 
                         // Push the new variant
                         results.push(ScanResult::YoutubeVideo {
@@ -49,14 +50,14 @@ impl Scanner for YoutubeScanner {
                         });
                     }
                     None => {
-                        println!("[DEBUG] Failure: Could not extract title for {}", url);
+                        debug!("[DEBUG] Failure: Could not extract title for {}", url);
                     }
                 }
             }
         }
 
         if results.is_empty() {
-            println!("[DEBUG] Scanner finished, but 0 results were added.");
+            debug!("[DEBUG] Scanner finished, but 0 results were added.");
         }
 
         Ok(results)
@@ -71,7 +72,7 @@ fn extract_between<'a>(s: &'a str, start_str: &str, end_str: &str) -> Option<&'a
 }
 
 async fn fetch_youtube_title_wget(url: &str) -> Option<String> {
-    println!("[DEBUG] 2. Spawning wget for: {}", url);
+    debug!("[DEBUG] 2. Spawning wget for: {}", url);
 
     // Call wget using tokio::process
     let output = Command::new("wget")
@@ -85,13 +86,13 @@ async fn fetch_youtube_title_wget(url: &str) -> Option<String> {
     let output = match output {
         Ok(out) => out,
         Err(e) => {
-            println!("[DEBUG] 3. Wget command failed to execute entirely: {}", e);
+            debug!("[DEBUG] 3. Wget command failed to execute entirely: {}", e);
             return None;
         }
     };
 
     if !output.status.success() {
-        println!(
+        debug!(
             "[DEBUG] 3. Wget returned an error status code: {}",
             output.status
         );
@@ -101,11 +102,11 @@ async fn fetch_youtube_title_wget(url: &str) -> Option<String> {
     let html = String::from_utf8_lossy(&output.stdout);
 
     if html.trim().is_empty() {
-        println!("[DEBUG] 3. Wget succeeded, but the downloaded HTML is empty.");
+        debug!("[DEBUG] 3. Wget succeeded, but the downloaded HTML is empty.");
         return None;
     }
 
-    println!("[DEBUG] 3. HTML downloaded successfully. Attempting to parse...");
+    debug!("[DEBUG] 3. HTML downloaded successfully. Attempting to parse...");
 
     // Try Lua exact logic first
     let start_str = r#"hNextResults":{"results":{"results":{"contents":[{"videoPrimaryInfoRenderer":{"title":{"runs":[{"text":""#;
@@ -121,7 +122,7 @@ async fn fetch_youtube_title_wget(url: &str) -> Option<String> {
     }
 
     // If it fails, print the first 200 chars of HTML so we know what YouTube sent us
-    println!(
+    debug!(
         "[DEBUG] 3. Parse failed! Could not find markers. First 200 chars of HTML: {:.200}",
         html
     );

@@ -4,6 +4,7 @@ use crate::scanners::Scanner;
 use crate::usafecode::get_linux_btime;
 use async_trait::async_trait;
 use chrono::{NaiveDate, NaiveDateTime};
+use log::debug;
 use regex::Regex;
 use std::fs;
 use std::time::UNIX_EPOCH;
@@ -63,7 +64,7 @@ impl Scanner for TimeScanner {
                 }
                 Err(e) => {
                     // Log or handle – but don't push fake time
-                    eprintln!("Cannot read metadata for {}: {}", ctx.path.display(), e);
+                    debug!("Cannot read metadata for {}: {}", ctx.path.display(), e);
                 }
             }
         }
