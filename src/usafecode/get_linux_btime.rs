@@ -37,7 +37,7 @@ struct Statx {
     pub __spare2: u64,
     pub __spare3: [u64; 12],
 }
-
+#[cfg(target_os = "linux")]
 pub fn get_linux_btime(path: &std::path::Path) -> Option<u64> {
     // Unix paths are technically raw bytes, not guaranteed to be valid UTF-8.
     // OsStrExt allows us to safely convert it to a CString.
@@ -63,5 +63,10 @@ pub fn get_linux_btime(path: &std::path::Path) -> Option<u64> {
         }
     }
 
+    None
+}
+// This should fix windows builds.
+#[cfg(not(target_os = "linux"))]
+pub fn get_linux_btime(_path: &std::path::Path) -> Option<u64> {
     None
 }
