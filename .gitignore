@@ -3,3 +3,6 @@ Cargo.toml.bak
 notes
 *.db
 Cargo.lock
+release
+.rustc_info.json
+x86_64-unknown-linux-musl
